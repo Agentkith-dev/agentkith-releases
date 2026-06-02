@@ -1,27 +1,37 @@
-# Release fanout — v1
+# Release fanout — v1.1 (Discord + Twitter + dev report)
 #
 # Fires on GitHub Release publish. Broadcasts the release to community
-# surfaces. GitHub Releases is the single source of truth; this workflow
-# is a pure fanout and never authors release notes.
+# surfaces and uploads a structured developer report as a workflow
+# artifact so anyone debugging a fanout can grab a JSON log of what
+# happened on each channel.
 #
-# The marketing site is NOT rebuilt from here. The /changelog page is
-# server-rendered with a short CDN cache, so it picks up new releases
-# automatically within ~5 minutes — no deploy hook, no API token, no
-# coordination between systems.
+# GitHub Releases is the single source of truth; this workflow is a
+# pure fanout — it never authors release notes, only forwards them.
+#
+# The marketing site is NOT rebuilt from here. /changelog is
+# server-rendered with a short CDN cache; new releases appear within
+# ~5 minutes automatically.
 #
 # Required repository secrets (configure in GitHub → Settings → Secrets):
-#   DISCORD_RELEASE_WEBHOOK   # Discord webhook URL for #announcements
+#   DISCORD_RELEASE_WEBHOOK     # Discord webhook URL for #announcements
 #
-# When the secret is unset the workflow runs and posts a job summary but
-# does not broadcast. Safe to commit before secrets are configured.
+# Optional repository secrets (each gates its own step):
+#   TWITTER_APP_KEY             # X/Twitter OAuth 1.0a app key
+#   TWITTER_APP_SECRET          # X/Twitter OAuth 1.0a app secret
+#   TWITTER_ACCESS_TOKEN        # X/Twitter user access token
+#   TWITTER_ACCESS_TOKEN_SECRET # X/Twitter user access token secret
+#
+# Any secret may be unset; steps are gated and skip cleanly. The
+# developer report (uploaded as an artifact on every run) records which
+# channels fired and which were skipped, so verifying after the fact is
+# one click in the Actions UI.
 #
 # v2 surfaces (scheduled, not yet wired):
-#   - Twitter/X via nearform-actions/github-action-notify-twitter
 #   - Email via Resend
 #   - In-app "What's New" modal (PRD/ADR/SPEC pending — touches app/src)
-#   - RSS feed at /changelog/rss.xml
 #
-# Adding a channel = add a step. The trigger and event payload do not change.
+# Adding a channel = add a step + a fact + a row in the report. The
+# trigger and event payload do not change.
 
 name: Announce release
 
@@ -34,19 +44,38 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ !github.event.release.draft }}
     steps:
+      # ── Fact capture ─────────────────────────────────────────────────────
+      # Single place that translates "secret X is set" into a step output
+      # consumable by every channel + the final report. Keeps each step's
+      # `if:` condition tidy.
       - name: Capture release facts
         id: facts
         env:
           DISCORD_WEBHOOK_SET: ${{ secrets.DISCORD_RELEASE_WEBHOOK != '' }}
+          TWITTER_KEY_SET: ${{ secrets.TWITTER_APP_KEY != '' }}
+          TWITTER_SECRET_SET: ${{ secrets.TWITTER_APP_SECRET != '' }}
+          TWITTER_TOKEN_SET: ${{ secrets.TWITTER_ACCESS_TOKEN != '' }}
+          TWITTER_TOKEN_SECRET_SET: ${{ secrets.TWITTER_ACCESS_TOKEN_SECRET != '' }}
         run: |
           echo "has_discord=${DISCORD_WEBHOOK_SET}" >> "$GITHUB_OUTPUT"
+          # Twitter requires all four OAuth 1.0a credentials.
+          if [ "$TWITTER_KEY_SET" = "true" ] \
+             && [ "$TWITTER_SECRET_SET" = "true" ] \
+             && [ "$TWITTER_TOKEN_SET" = "true" ] \
+             && [ "$TWITTER_TOKEN_SECRET_SET" = "true" ]; then
+            echo "has_twitter=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_twitter=false" >> "$GITHUB_OUTPUT"
+          fi
           echo "Release ${{ github.event.release.tag_name }} (prerelease=${{ github.event.release.prerelease }})"
 
       # ── Discord ──────────────────────────────────────────────────────────
       # Posts a rich embed to #announcements. Prereleases are included so
       # early-access channels can see them; mute server-side if not desired.
       - name: Discord announce
+        id: discord
         if: ${{ steps.facts.outputs.has_discord == 'true' }}
+        continue-on-error: true
         uses: sarisia/actions-status-discord@v1
         with:
           webhook: ${{ secrets.DISCORD_RELEASE_WEBHOOK }}
@@ -63,17 +92,145 @@ jobs:
 
             **[Open release notes →](${{ github.event.release.html_url }})**
 
-      # ── Summary ──────────────────────────────────────────────────────────
-      - name: Summary
+      # ── Twitter / X ──────────────────────────────────────────────────────
+      # Posts a single tweet linking to /changelog. Prereleases are skipped
+      # to avoid noisy public timelines for internal smoke tests.
+      - name: Twitter announce
+        id: twitter
+        if: ${{ steps.facts.outputs.has_twitter == 'true' && !github.event.release.prerelease }}
+        continue-on-error: true
+        uses: nearform-actions/github-action-notify-twitter@v1
+        with:
+          message: |
+            🚀 Agentkith ${{ github.event.release.tag_name }} — ${{ github.event.release.name }}
+
+            Full notes → https://agentkith.dev/changelog
+          twitter-app-key: ${{ secrets.TWITTER_APP_KEY }}
+          twitter-app-secret: ${{ secrets.TWITTER_APP_SECRET }}
+          twitter-access-token: ${{ secrets.TWITTER_ACCESS_TOKEN }}
+          twitter-access-token-secret: ${{ secrets.TWITTER_ACCESS_TOKEN_SECRET }}
+
+      # ── Developer report ────────────────────────────────────────────────
+      # Writes a structured JSON log of which channels fired, uploads it
+      # as a workflow artifact, and renders a rich markdown summary on
+      # the run page. Helps debug "did Discord actually fire?" without
+      # logging into Discord.
+      - name: Build developer report
+        id: report
         if: always()
+        env:
+          DISCORD_OUTCOME: ${{ steps.discord.outcome }}
+          TWITTER_OUTCOME: ${{ steps.twitter.outcome }}
+          HAS_DISCORD: ${{ steps.facts.outputs.has_discord }}
+          HAS_TWITTER: ${{ steps.facts.outputs.has_twitter }}
         run: |
+          mkdir -p report
+
+          # Status helper — distinguishes "ran and succeeded", "ran and
+          # failed", "skipped because no secret", and "skipped because
+          # prerelease".
+          discord_status() {
+            if [ "$HAS_DISCORD" != "true" ]; then
+              echo "skipped — DISCORD_RELEASE_WEBHOOK secret not set"
+            elif [ "$DISCORD_OUTCOME" = "success" ]; then
+              echo "sent"
+            elif [ "$DISCORD_OUTCOME" = "failure" ]; then
+              echo "failed — see Discord step log"
+            else
+              echo "$DISCORD_OUTCOME"
+            fi
+          }
+
+          twitter_status() {
+            if [ "${{ github.event.release.prerelease }}" = "true" ]; then
+              echo "skipped — prerelease"
+            elif [ "$HAS_TWITTER" != "true" ]; then
+              echo "skipped — TWITTER_APP_KEY (or related) secret not set"
+            elif [ "$TWITTER_OUTCOME" = "success" ]; then
+              echo "sent"
+            elif [ "$TWITTER_OUTCOME" = "failure" ]; then
+              echo "failed — see Twitter step log"
+            else
+              echo "$TWITTER_OUTCOME"
+            fi
+          }
+
+          DISCORD_STATUS=$(discord_status)
+          TWITTER_STATUS=$(twitter_status)
+
+          # JSON report — machine readable, uploaded as artifact.
+          cat > report/release-report.json <<JSON
           {
-            echo "## Release ${{ github.event.release.tag_name }}"
+            "schema_version": 1,
+            "release": {
+              "tag": "${{ github.event.release.tag_name }}",
+              "name": ${{ toJSON(github.event.release.name) }},
+              "url": "${{ github.event.release.html_url }}",
+              "is_prerelease": ${{ github.event.release.prerelease }},
+              "published_at": "${{ github.event.release.published_at }}",
+              "author": "${{ github.event.release.author.login }}"
+            },
+            "workflow": {
+              "run_id": "${{ github.run_id }}",
+              "run_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+              "actor": "${{ github.actor }}",
+              "started_at": "${{ github.event.release.published_at }}"
+            },
+            "channels": {
+              "discord": {
+                "secret_present": ${{ steps.facts.outputs.has_discord }},
+                "outcome": "${{ steps.discord.outcome || 'skipped' }}",
+                "status": "$DISCORD_STATUS"
+              },
+              "twitter": {
+                "secret_present": ${{ steps.facts.outputs.has_twitter }},
+                "outcome": "${{ steps.twitter.outcome || 'skipped' }}",
+                "status": "$TWITTER_STATUS"
+              },
+              "changelog_page": {
+                "url": "https://agentkith.dev/changelog/",
+                "refresh_strategy": "SSR + CDN cache (~5 min TTL)"
+              },
+              "rss_feed": {
+                "url": "https://agentkith.dev/changelog/rss.xml",
+                "refresh_strategy": "SSR + CDN cache (~30 min TTL)"
+              }
+            }
+          }
+          JSON
+
+          # Markdown summary — pinned to the run page.
+          {
+            echo "# 🚀 Release ${{ github.event.release.tag_name }}"
+            echo ""
+            echo "**${{ github.event.release.name }}**"
             echo ""
             echo "| Channel | Status |"
-            echo "|---------|--------|"
-            echo "| Discord | ${{ steps.facts.outputs.has_discord == 'true' && 'sent' || 'skipped (no webhook secret)' }} |"
-            echo "| Website /changelog | refreshes within 5 min via CDN cache (no rebuild needed) |"
+            echo "|---|---|"
+            echo "| Discord | $DISCORD_STATUS |"
+            echo "| Twitter | $TWITTER_STATUS |"
+            echo "| Website /changelog | reflects within ~5 min (SSR + CDN cache) |"
+            echo "| RSS /changelog/rss.xml | reflects within ~30 min (SSR + CDN cache) |"
             echo ""
-            echo "[Release on GitHub](${{ github.event.release.html_url }})"
+            echo "### Release"
+            echo ""
+            echo "- Tag: \`${{ github.event.release.tag_name }}\`"
+            echo "- Type: ${{ github.event.release.prerelease && 'preview' || 'stable' }}"
+            echo "- Published: ${{ github.event.release.published_at }}"
+            echo "- Author: @${{ github.event.release.author.login }}"
+            echo "- GitHub: [${{ github.event.release.html_url }}](${{ github.event.release.html_url }})"
+            echo ""
+            echo "### Run"
+            echo ""
+            echo "- ID: \`${{ github.run_id }}\`"
+            echo "- Actor: @${{ github.actor }}"
+            echo "- Full report (machine-readable): see the **release-report** artifact attached to this run."
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload developer report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-report-${{ github.event.release.tag_name }}
+          path: report/release-report.json
+          retention-days: 90
