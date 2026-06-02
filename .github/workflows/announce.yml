@@ -1,0 +1,79 @@
+# Release fanout — v1
+#
+# Fires on GitHub Release publish. Broadcasts the release to community
+# surfaces. GitHub Releases is the single source of truth; this workflow
+# is a pure fanout and never authors release notes.
+#
+# The marketing site is NOT rebuilt from here. The /changelog page is
+# server-rendered with a short CDN cache, so it picks up new releases
+# automatically within ~5 minutes — no deploy hook, no API token, no
+# coordination between systems.
+#
+# Required repository secrets (configure in GitHub → Settings → Secrets):
+#   DISCORD_RELEASE_WEBHOOK   # Discord webhook URL for #announcements
+#
+# When the secret is unset the workflow runs and posts a job summary but
+# does not broadcast. Safe to commit before secrets are configured.
+#
+# v2 surfaces (scheduled, not yet wired):
+#   - Twitter/X via nearform-actions/github-action-notify-twitter
+#   - Email via Resend
+#   - In-app "What's New" modal (PRD/ADR/SPEC pending — touches app/src)
+#   - RSS feed at /changelog/rss.xml
+#
+# Adding a channel = add a step. The trigger and event payload do not change.
+
+name: Announce release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  fanout:
+    runs-on: ubuntu-latest
+    if: ${{ !github.event.release.draft }}
+    steps:
+      - name: Capture release facts
+        id: facts
+        env:
+          DISCORD_WEBHOOK_SET: ${{ secrets.DISCORD_RELEASE_WEBHOOK != '' }}
+        run: |
+          echo "has_discord=${DISCORD_WEBHOOK_SET}" >> "$GITHUB_OUTPUT"
+          echo "Release ${{ github.event.release.tag_name }} (prerelease=${{ github.event.release.prerelease }})"
+
+      # ── Discord ──────────────────────────────────────────────────────────
+      # Posts a rich embed to #announcements. Prereleases are included so
+      # early-access channels can see them; mute server-side if not desired.
+      - name: Discord announce
+        if: ${{ steps.facts.outputs.has_discord == 'true' }}
+        uses: sarisia/actions-status-discord@v1
+        with:
+          webhook: ${{ secrets.DISCORD_RELEASE_WEBHOOK }}
+          nodetail: true
+          username: Agentkith Releases
+          avatar_url: https://agentkith.dev/favicon.png
+          color: 0x4d8ef7
+          title: >-
+            Agentkith ${{ github.event.release.tag_name }}${{
+              github.event.release.prerelease && ' (preview)' || ''
+            }}
+          description: |
+            ${{ github.event.release.body }}
+
+            **[Open release notes →](${{ github.event.release.html_url }})**
+
+      # ── Summary ──────────────────────────────────────────────────────────
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Release ${{ github.event.release.tag_name }}"
+            echo ""
+            echo "| Channel | Status |"
+            echo "|---------|--------|"
+            echo "| Discord | ${{ steps.facts.outputs.has_discord == 'true' && 'sent' || 'skipped (no webhook secret)' }} |"
+            echo "| Website /changelog | refreshes within 5 min via CDN cache (no rebuild needed) |"
+            echo ""
+            echo "[Release on GitHub](${{ github.event.release.html_url }})"
+          } >> "$GITHUB_STEP_SUMMARY"
