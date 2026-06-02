@@ -97,7 +97,9 @@ jobs:
       # to avoid noisy public timelines for internal smoke tests.
       - name: Twitter announce
         id: twitter
-        if: ${{ steps.facts.outputs.has_twitter == 'true' && !github.event.release.prerelease }}
+        # TEMP: prerelease guard removed for one-off smoke test on v0.0.3-tw-smoke.
+        # Reverted in the very next commit.
+        if: ${{ steps.facts.outputs.has_twitter == 'true' }}
         continue-on-error: true
         uses: nearform-actions/github-action-notify-twitter@v1
         with:
