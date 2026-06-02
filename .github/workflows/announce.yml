@@ -1,9 +1,8 @@
-# Release fanout — v1.1 (Discord + Twitter + dev report)
+# Release fanout — v1.2 (Discord + dev report)
 #
 # Fires on GitHub Release publish. Broadcasts the release to community
 # surfaces and uploads a structured developer report as a workflow
-# artifact so anyone debugging a fanout can grab a JSON log of what
-# happened on each channel.
+# artifact.
 #
 # GitHub Releases is the single source of truth; this workflow is a
 # pure fanout — it never authors release notes, only forwards them.
@@ -15,23 +14,16 @@
 # Required repository secrets (configure in GitHub → Settings → Secrets):
 #   DISCORD_RELEASE_WEBHOOK     # Discord webhook URL for #announcements
 #
-# Optional repository secrets (each gates its own step):
-#   TWITTER_APP_KEY             # X/Twitter OAuth 1.0a app key
-#   TWITTER_APP_SECRET          # X/Twitter OAuth 1.0a app secret
-#   TWITTER_ACCESS_TOKEN        # X/Twitter user access token
-#   TWITTER_ACCESS_TOKEN_SECRET # X/Twitter user access token secret
-#
-# Any secret may be unset; steps are gated and skip cleanly. The
-# developer report (uploaded as an artifact on every run) records which
-# channels fired and which were skipped, so verifying after the fact is
-# one click in the Actions UI.
+# When the secret is unset the workflow runs and posts a job summary
+# but does not broadcast. Safe to commit before secrets are configured.
 #
 # v2 surfaces (scheduled, not yet wired):
+#   - Twitter/X — recipe in DOCS/PRODUCT_DOCS/Agentkith/releases/announce-playbook.md
+#     (gated on X API tier supporting POST /tweets without payment friction)
 #   - Email via Resend
 #   - In-app "What's New" modal (PRD/ADR/SPEC pending — touches app/src)
 #
-# Adding a channel = add a step + a fact + a row in the report. The
-# trigger and event payload do not change.
+# Adding a channel = add a step + a fact + a row in the report.
 
 name: Announce release
 
@@ -45,28 +37,12 @@ jobs:
     if: ${{ !github.event.release.draft }}
     steps:
       # ── Fact capture ─────────────────────────────────────────────────────
-      # Single place that translates "secret X is set" into a step output
-      # consumable by every channel + the final report. Keeps each step's
-      # `if:` condition tidy.
       - name: Capture release facts
         id: facts
         env:
           DISCORD_WEBHOOK_SET: ${{ secrets.DISCORD_RELEASE_WEBHOOK != '' }}
-          TWITTER_KEY_SET: ${{ secrets.TWITTER_APP_KEY != '' }}
-          TWITTER_SECRET_SET: ${{ secrets.TWITTER_APP_SECRET != '' }}
-          TWITTER_TOKEN_SET: ${{ secrets.TWITTER_ACCESS_TOKEN != '' }}
-          TWITTER_TOKEN_SECRET_SET: ${{ secrets.TWITTER_ACCESS_TOKEN_SECRET != '' }}
         run: |
           echo "has_discord=${DISCORD_WEBHOOK_SET}" >> "$GITHUB_OUTPUT"
-          # Twitter requires all four OAuth 1.0a credentials.
-          if [ "$TWITTER_KEY_SET" = "true" ] \
-             && [ "$TWITTER_SECRET_SET" = "true" ] \
-             && [ "$TWITTER_TOKEN_SET" = "true" ] \
-             && [ "$TWITTER_TOKEN_SECRET_SET" = "true" ]; then
-            echo "has_twitter=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_twitter=false" >> "$GITHUB_OUTPUT"
-          fi
           echo "Release ${{ github.event.release.tag_name }} (prerelease=${{ github.event.release.prerelease }})"
 
       # ── Discord ──────────────────────────────────────────────────────────
@@ -92,45 +68,19 @@ jobs:
 
             **[Open release notes →](${{ github.event.release.html_url }})**
 
-      # ── Twitter / X ──────────────────────────────────────────────────────
-      # Posts a single tweet linking to /changelog. Prereleases are skipped
-      # to avoid noisy public timelines for internal smoke tests.
-      - name: Twitter announce
-        id: twitter
-        if: ${{ steps.facts.outputs.has_twitter == 'true' && !github.event.release.prerelease }}
-        continue-on-error: true
-        uses: nearform-actions/github-action-notify-twitter@v1
-        with:
-          # release.name typically starts with the tag (e.g. "v0.2.0 — Title")
-          # so we use it directly instead of prefixing the tag again.
-          message: |
-            🚀 ${{ github.event.release.name }}
-
-            Full notes → https://agentkith.dev/changelog
-          twitter-app-key: ${{ secrets.TWITTER_APP_KEY }}
-          twitter-app-secret: ${{ secrets.TWITTER_APP_SECRET }}
-          twitter-access-token: ${{ secrets.TWITTER_ACCESS_TOKEN }}
-          twitter-access-token-secret: ${{ secrets.TWITTER_ACCESS_TOKEN_SECRET }}
-
       # ── Developer report ────────────────────────────────────────────────
       # Writes a structured JSON log of which channels fired, uploads it
       # as a workflow artifact, and renders a rich markdown summary on
-      # the run page. Helps debug "did Discord actually fire?" without
-      # logging into Discord.
+      # the run page.
       - name: Build developer report
         id: report
         if: always()
         env:
           DISCORD_OUTCOME: ${{ steps.discord.outcome }}
-          TWITTER_OUTCOME: ${{ steps.twitter.outcome }}
           HAS_DISCORD: ${{ steps.facts.outputs.has_discord }}
-          HAS_TWITTER: ${{ steps.facts.outputs.has_twitter }}
         run: |
           mkdir -p report
 
-          # Status helper — distinguishes "ran and succeeded", "ran and
-          # failed", "skipped because no secret", and "skipped because
-          # prerelease".
           discord_status() {
             if [ "$HAS_DISCORD" != "true" ]; then
               echo "skipped — DISCORD_RELEASE_WEBHOOK secret not set"
@@ -143,22 +93,7 @@ jobs:
             fi
           }
 
-          twitter_status() {
-            if [ "${{ github.event.release.prerelease }}" = "true" ]; then
-              echo "skipped — prerelease"
-            elif [ "$HAS_TWITTER" != "true" ]; then
-              echo "skipped — TWITTER_APP_KEY (or related) secret not set"
-            elif [ "$TWITTER_OUTCOME" = "success" ]; then
-              echo "sent"
-            elif [ "$TWITTER_OUTCOME" = "failure" ]; then
-              echo "failed — see Twitter step log"
-            else
-              echo "$TWITTER_OUTCOME"
-            fi
-          }
-
           DISCORD_STATUS=$(discord_status)
-          TWITTER_STATUS=$(twitter_status)
 
           # JSON report — machine readable, uploaded as artifact.
           cat > report/release-report.json <<JSON
@@ -184,11 +119,6 @@ jobs:
                 "outcome": "${{ steps.discord.outcome || 'skipped' }}",
                 "status": "$DISCORD_STATUS"
               },
-              "twitter": {
-                "secret_present": ${{ steps.facts.outputs.has_twitter }},
-                "outcome": "${{ steps.twitter.outcome || 'skipped' }}",
-                "status": "$TWITTER_STATUS"
-              },
               "changelog_page": {
                 "url": "https://agentkith.dev/changelog/",
                 "refresh_strategy": "SSR + CDN cache (~5 min TTL)"
@@ -210,7 +140,6 @@ jobs:
             echo "| Channel | Status |"
             echo "|---|---|"
             echo "| Discord | $DISCORD_STATUS |"
-            echo "| Twitter | $TWITTER_STATUS |"
             echo "| Website /changelog | reflects within ~5 min (SSR + CDN cache) |"
             echo "| RSS /changelog/rss.xml | reflects within ~30 min (SSR + CDN cache) |"
             echo ""
